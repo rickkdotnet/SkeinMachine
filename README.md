@@ -1,7 +1,7 @@
 # 🧶 SkeinMachine v3.19 — Smart Yarn Twister Controller
 
-An Arduino-based controller for an electric yarn twister (skein winder).  
-It automates the twisting of yarn skeins to a precise number of turns and always stops at the same hook position.  
+An Arduino-based controller for an electric yarn twister (skein winder), inspired by the [Alpenglow SkeinTwister](https://www.alpenglowindustries.com/pages/skeintwister).   
+It automates the twisting of yarn skeins to a precise number of turns tries to always stops at the same hook position.  
 The system combines encoder feedback, closed-loop motor control, and a compact user interface for smooth, repeatable results.
 
 ---
@@ -52,6 +52,7 @@ The system combines encoder feedback, closed-loop motor control, and a compact u
 | Component | Description |
 |------------|--------------|
 | **MCU** | Arduino Nano / Uno (ATmega328P) |
+| **Motor** | 5840-36ZY 12V worm gear motor with encoder from AliExpress (note that the -36ZY is supposedly stronger than the -32ZY variant)
 | **Motor driver** | Cytron MD13S |
 | **Motor encoder** | Quadrature encoder (e.g. 16 PPR × 49 gear ≈ 9300 counts per rev) |
 | **Inputs** | Foot pedal (active-LOW), KY-040 rotary encoder + push button |
@@ -106,7 +107,7 @@ The system combines encoder feedback, closed-loop motor control, and a compact u
 - Safe manual operation  
 - Clean, responsive OLED interface  
 
-Perfect for yarn dyers, spinners, and hobbyists who want consistent, professional skeins without guesswork.
+Perfect for yarn dyers, spinners, and hobbyists who want consistent, professional skeins.
 
 ---
 
