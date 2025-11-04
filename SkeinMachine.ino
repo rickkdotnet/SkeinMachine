@@ -559,6 +559,7 @@ int16_t rpm10SinceWindow() {
   g_rpm_lastCounts = cNow;
   g_rpm_lastMs = now;
   if (dt == 0) return INT16_MIN;
+
   long num = delta * 5625L;
   long den = (long)dt * 29L;
   long v;
@@ -661,6 +662,9 @@ void rotaryServiceFromQueue() {
 
       g_manualDidPedalRun   = false;
 
+      // Reset speed controller when leaving MANUAL
+      resetSpeedControllerState();
+
     } else if (prev == Mode::MANUAL && g_mode == Mode::AUTO) {
       // Anchor always set when returning to AUTO
       uint16_t ph = phaseFromAbsCountsT1000(encAbsAtomicRead());
@@ -679,6 +683,9 @@ void rotaryServiceFromQueue() {
         g_persistDirty  = true;
       }
       motorAnalogWrite(0);
+
+      // Reset speed controller when entering AUTO
+      resetSpeedControllerState();
     }
   }
 }
@@ -1073,38 +1080,42 @@ void uiLifetimeSplashTopRightLogo(){
 // ================================================================
 // [8] CLOSED-LOOP SPEED CONTROL (AUTO)
 // ================================================================
-// Called whenever a fresh RPM sample is available (≈ every RPM_WINDOW_MS)
-// Implements a simple PI controller in Q15 fixed-point:
-//   u = u_ff + Kp*(e) + Ki*∑e
-// Here u_ff = 0 (no explicit feedforward); you may add a duty bias later.
+// Add this function BEFORE speedControllerOnRpmSample()
+void resetSpeedControllerState() {
+  // Reset all speed controller state variables
+  g_iTerm_Q15 = 0;
+  g_ctrlOutPwm = 0;
+  g_rpmSetpoint10 = 0;
+  g_rpmDesiredSetpoint10 = 0;
+  g_rpmPrevDesired10 = INT16_MIN;
+  // The static variables in speedControllerOnRpmSample will reset themselves
+  // when state transitions from IDLE
+}
 
-// ================================================================
-// [8] CLOSED-LOOP SPEED CONTROL (AUTO)
-// ================================================================
-// Called whenever a fresh RPM sample is available (≈ every RPM_WINDOW_MS)
-// Implements a PI controller with feedforward and output smoothing.
-//  - Uses one global minimum PWM (CTRL_PWM_MIN) for both bands.
-//  - Reseeds smoothing on transition RAMP_UP -> RUN to avoid a duty dip.
+// Updated speedControllerOnRpmSample with fixes
 void speedControllerOnRpmSample(int16_t rpm10) {
   if (g_mode != Mode::AUTO) return;
-  // Controller operates only in AUTO during RAMP_UP (internal) and RUN (output used)
   if (g_state != RunState::RAMP_UP && g_state != RunState::RUN) return;
   if (rpm10 == INT16_MIN) return;
 
   // ---- State transition tracking for handover smoothing ----
-  // We want the smoothed PWM (lastPwm) to start from the *current* PWM
-  // when entering RUN, to avoid a dip after open-loop ramp-up.
   static RunState s_prevState = RunState::IDLE;
-  static int      lastPwm     = 0;    // smoothed controller output
+  static int      lastPwm     = 0;
   static bool     lastPwmInit = false;
+  // FIX: Move these out to persist across calls but reset properly
+  static int16_t  rpm10_lp    = 0;
+  static bool     lpInited    = false;
 
   RunState stNow = g_state;
   if (stNow != s_prevState) {
     if (stNow == RunState::RUN) {
       // Just entered RUN from RAMP_UP or IDLE:
-      // start smoothing from the actual PWM level
       lastPwm     = g_pwmNow;
       lastPwmInit = true;
+    }
+    // FIX: Reset RPM filter when starting a new run sequence
+    if (s_prevState == RunState::IDLE) {
+      lpInited = false;
     }
     s_prevState = stNow;
   }
@@ -1112,36 +1123,33 @@ void speedControllerOnRpmSample(int16_t rpm10) {
   bool inRampUp = (g_state == RunState::RAMP_UP);
 
   // In RUN, allow a short settling time before applying controller output
-  if (!inRampUp && (millis() - g_stateStartMs) < 300UL) return;
+  // if (!inRampUp && (millis() - g_stateStartMs) < 300UL) return;
 
   // ---- RPM filtering ----
-  // In CREEP: use raw RPM (less lag).
-  // Outside CREEP: apply a light IIR low-pass (beta ≈ 1/3).
   int16_t rpm10_f;
   if (g_inCreepBand) {
     rpm10_f = rpm10;
   } else {
-    static int16_t rpm10_lp = 0;
-    static bool    lpInited = false;
+    // FIX: These are now static at function level (see above)
     if (!lpInited) {
       rpm10_lp = rpm10;
       lpInited = true;
     }
     int32_t d = (int32_t)rpm10 - (int32_t)rpm10_lp;
-    rpm10_lp += (int16_t)((d + 1) / 3);  // ~1/3 of delta
+    rpm10_lp += (int16_t)((d + 1) / 3);
     rpm10_f = rpm10_lp;
   }
 
   // ---- Setpoint ----
-  int16_t sp10 = g_rpmSetpoint10;   // ×10 RPM
+  int16_t sp10 = g_rpmSetpoint10;
   if (sp10 <= 0) {
     g_desiredPwmTarget = 0;
     g_iTerm_Q15        = 0;
     return;
   }
 
-  // Feedforward: duty ≈ FF_B_DUTY + FF_A * RPM
-  int16_t spRPM = (sp10 + 5) / 10;  // round to integer RPM
+  // Feedforward
+  int16_t spRPM = (sp10 + 5) / 10;
   int32_t u_ff  = FF_B_DUTY + ((int32_t)spRPM * FF_A_NUM + (FF_A_DEN / 2)) / FF_A_DEN;
 
   // ---- Error in integer RPM ----
@@ -1159,7 +1167,7 @@ void speedControllerOnRpmSample(int16_t rpm10) {
   }
 
   // ---- Deadband ----
-  int8_t dband = g_inCreepBand ? 1 : RPM_DBAND_RPM;  // tighter in CREEP
+  int8_t dband = g_inCreepBand ? 1 : RPM_DBAND_RPM;
 
   // ---- Proportional term ----
   int32_t p_Q15 = 0;
@@ -1169,16 +1177,14 @@ void speedControllerOnRpmSample(int16_t rpm10) {
 
   // ---- Conditional integration with anti-windup ----
   if (Ki > 0 && abs(errRPM) > dband) {
-    // Predict output before integrating further
     int32_t tentative_Q15 = p_Q15 + g_iTerm_Q15;
     int32_t tentative_pwm = (tentative_Q15 >> 8) + u_ff;
 
     bool atUpper     = tentative_pwm >= (CTRL_PWM_MAX - 5);
     bool atLower     = tentative_pwm <= (CTRL_PWM_MIN + 5);
-    bool drivesUpper = (errRPM > 0);   // positive error pushes duty up
-    bool drivesLower = (errRPM < 0);   // negative error pushes duty down
+    bool drivesUpper = (errRPM > 0);
+    bool drivesLower = (errRPM < 0);
 
-    // Only integrate when we are not pushing further into saturation
     if (!(atUpper && drivesUpper) && !(atLower && drivesLower)) {
       g_iTerm_Q15 += (int32_t)Ki * (int32_t)errRPM;
       if (g_iTerm_Q15 > ITERM_MAX) g_iTerm_Q15 = ITERM_MAX;
@@ -1188,7 +1194,7 @@ void speedControllerOnRpmSample(int16_t rpm10) {
 
   // ---- Combine FF + PI ----
   int32_t u_Q15 = p_Q15 + g_iTerm_Q15;
-  int32_t u_pwm = (u_Q15 >> 8) + u_ff;   // scale down & add feedforward
+  int32_t u_pwm = (u_Q15 >> 8) + u_ff;
 
   // ---- Clamp to controller limits ----
   if (u_pwm < CTRL_PWM_MIN) u_pwm = CTRL_PWM_MIN;
@@ -1196,16 +1202,13 @@ void speedControllerOnRpmSample(int16_t rpm10) {
 
   // ---- Output smoothing (per RPM sample) ----
   if (!lastPwmInit) {
-    // First time: jump directly to computed PWM to avoid a dip
     lastPwm     = (int)u_pwm;
     lastPwmInit = true;
   } else {
     int delta = (int)u_pwm - lastPwm;
     if (g_inCreepBand) {
-      // gentler smoothing in CREEP (~1/4 step)
       lastPwm = lastPwm + ((delta + 2) / 4);
     } else {
-      // generic IIR smoothing (ALPHA_NUM / ALPHA_DEN)
       lastPwm += (delta * ALPHA_NUM) / ALPHA_DEN;
     }
   }
@@ -1384,6 +1387,7 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
       } else {
         unsigned long rampElapsed = elapsed - START_KICK_MS;
         
+        // RAMP_UP transitioning to RUN:
         if (rampElapsed >= rampUpMs) {
           // Calculate the duty we've ramped up to
           int16_t targetRPM = (g_inCreepBand ? RPM_CREEP_10 : RPM_FAST_10) / 10;
@@ -1397,21 +1401,25 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
           g_rpmSetpoint10 = g_rpmDesiredSetpoint10;
           g_rpmPrevDesired10 = g_rpmDesiredSetpoint10;
           
-          // Pre-load controller state to match current open-loop duty
+          // Set all PWM variables to prevent glitch
           g_desiredPwmTarget = (int)targetDuty;
           g_pwmTarget = (int)targetDuty;
           g_prevDesired = (int)targetDuty;
           
-          // Pre-bias integrator so PI output ≈ current duty (duty - feedforward = I-term contribution)
+          // FIX: Correct integrator pre-loading
           int32_t ff = FF_B_DUTY + ((int32_t)targetRPM * FF_A_NUM + (FF_A_DEN/2)) / FF_A_DEN;
-          int32_t i_contribution = ((int32_t)targetDuty - ff) << 8;  // convert to Q15 scaled by 256
-          g_iTerm_Q15 = i_contribution << 7;  // shift to Q15 domain (total <<15)
+          g_iTerm_Q15 = ((int32_t)targetDuty - ff) << 8;  // Correct scaling
+          
+          // Clamp integrator
           if (g_iTerm_Q15 > ITERM_MAX) g_iTerm_Q15 = ITERM_MAX;
           if (g_iTerm_Q15 < ITERM_MIN) g_iTerm_Q15 = ITERM_MIN;
           
+          // FIX: Force controller output to match current PWM
+          g_ctrlOutPwm = (int)targetDuty;
+          
           g_state = RunState::RUN;
-
-        } else {
+          g_stateStartMs = millis();  // Reset state timer for RUN
+         } else {
           // Linear PWM ramp from START_KICK_PWM to estimated duty
           int16_t targetRPM = (g_inCreepBand ? RPM_CREEP_10 : RPM_FAST_10) / 10;
           int32_t targetDuty = FF_B_DUTY + ((int32_t)targetRPM * FF_A_NUM + (FF_A_DEN/2)) / FF_A_DEN;
@@ -1439,14 +1447,35 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
       // Enter/exit creep band by position error; set RPM setpoint accordingly.
       long approachEnter = APPROACH_COUNTS;
       long approachExit  = APPROACH_COUNTS + APPROACH_HYST_COUNTS;
+      
+      bool wasInCreep = g_inCreepBand;  // FIX: Track previous state
+      
       if (!g_inCreepBand) {
-        if (error <= approachEnter) { g_inCreepBand = true;  g_rpmDesiredSetpoint10 = RPM_CREEP_10; g_rpmSlewDurationMs = CREEP_SLEW_MS; }
-        else                        { g_rpmDesiredSetpoint10 = RPM_FAST_10;  g_rpmSlewDurationMs = CREEP_TRANSITION_MS; }
+        if (error <= approachEnter) { 
+          g_inCreepBand = true;  
+          g_rpmDesiredSetpoint10 = RPM_CREEP_10; 
+          g_rpmSlewDurationMs = CREEP_SLEW_MS;
+          // FIX: Scale down integrator when entering creep
+          g_iTerm_Q15 = g_iTerm_Q15 / 3;
+        }
+        else { 
+          g_rpmDesiredSetpoint10 = RPM_FAST_10;  
+          g_rpmSlewDurationMs = CREEP_TRANSITION_MS; 
+        }
       } else {
-        if (error > approachExit) { g_inCreepBand = false; g_rpmDesiredSetpoint10 = RPM_FAST_10; g_rpmSlewDurationMs = CREEP_TRANSITION_MS; }
-        else                      { g_rpmDesiredSetpoint10 = RPM_CREEP_10;  g_rpmSlewDurationMs = CREEP_SLEW_MS; }
+        if (error > approachExit) { 
+          g_inCreepBand = false; 
+          g_rpmDesiredSetpoint10 = RPM_FAST_10; 
+          g_rpmSlewDurationMs = CREEP_TRANSITION_MS;
+          // FIX: Reset integrator when exiting creep (unusual but handle it)
+          g_iTerm_Q15 = 0;
+        }
+        else { 
+          g_rpmDesiredSetpoint10 = RPM_CREEP_10;  
+          g_rpmSlewDurationMs = CREEP_SLEW_MS; 
+        }
       }
-
+      
       updateRpmSlew(now);        // move setpoint toward desired band target
       motorAnalogWrite(g_pwmTarget);
 
@@ -1690,30 +1719,35 @@ void loop() {
 
   // ---- Stall detection (only in RUN state) ----
   if (g_state == RunState::RUN && rpm10 != INT16_MIN) {
-    bool runLongEnough = (millis() - g_stateStartMs) >= STALL_MIN_RUN_MS;
     int16_t absrpm10 = (rpm10 < 0) ? -rpm10 : rpm10;
-
-    bool allowStall = false;
-    // Grace period after entering RUN, and require motor reached minimum speed
-    if (runLongEnough && (millis() - g_stateStartMs) >= RUN_STALL_GRACE_MS) {
-      int16_t sp10 = g_rpmSetpoint10;
-      int16_t minEnable10 = (int16_t)(( (int32_t)sp10 * STALL_ENABLE_FRAC_NUM ) / STALL_ENABLE_FRAC_DEN);
-      if (absrpm10 >= (minEnable10>0?minEnable10:0)) {
-        allowStall = (g_pwmNow >= STALL_MIN_PWM) && (!STALL_DISABLE_IN_CREEP || !g_inCreepBand);
+    unsigned long runTime = millis() - g_stateStartMs;
+    
+    // Wait for grace period before any stall detection
+    if (runTime >= RUN_STALL_GRACE_MS) {
+      bool stallDetected = false;
+      
+      // Simple check: if we're applying power but RPM is too low = stall
+      if (g_pwmNow >= STALL_MIN_PWM && absrpm10 < STALL_RPM10_THRESH) {
+        stallDetected = true;
       }
-    }
+      
+      // Honor the creep disable flag if set
+      if (STALL_DISABLE_IN_CREEP && g_inCreepBand) {
+        stallDetected = false;
+      }
+      
+      if (stallDetected && !g_stallLatched) {
+        g_stallLatched = true;
+        showToastC(F("STALL"), 900, 2);
+        g_persist.stallCount++;
+        persistMarkDirty();
 
-    if (allowStall && absrpm10 < STALL_RPM10_THRESH && !g_stallLatched) {
-      g_stallLatched = true;
-      showToastC(F("STALL"), 900, 2);
-      g_persist.stallCount++;
-      persistMarkDirty();
-
-      // Graceful stop via ramp-down
-      g_startDuty = g_pwmNow;
-      g_state = RunState::RAMP_DOWN;
-      g_stateStartMs = millis();
-      g_rampDownPlanned = false;
+        // Graceful stop via ramp-down  
+        g_startDuty = g_pwmNow;
+        g_state = RunState::RAMP_DOWN;
+        g_stateStartMs = millis();
+        g_rampDownPlanned = false;
+      }
     }
   }
   if (g_state == RunState::IDLE) g_stallLatched = false;
