@@ -1,13 +1,19 @@
 // ----------------------------------------------------------------
-// SkeinMachine v3.28
+// SkeinMachine v3.30
 // Smart yarn-twister controller with phase-anchored AUTO stops
 // NOW WITH CLOSED-LOOP RPM CONTROL (FAST & CREEP BANDS)
 // ----------------------------------------------------------------
 // Controls a DC motor via Cytron MD13S for precise skein twisting.
 // Uses encoder feedback and adaptive braking.
 //
-// NEW IN v3.27
-// - Remove some magic numbers, other small fixes
+// NEW IN v3.30 
+// - FAST→CREEP RPM transition distance-based (span in milli-turns)
+//   instead of time-based slewing
+// - S-curve (smoothstep) ramps for MANUAL and AUTO ramp-up/down
+//   for smoother acceleration/deceleration
+// NEW IN v3.29
+// - FAST→CREEP RPM transition distance-based (span in milli-turns)
+//   instead of time-based CREEP_TRANSITION_MS / CREEP_SLEW_MS
 //
 // RATIONALE
 //  Heavy skeins caused RPM sag in the former PWM_CREEP band. With a PI speed
@@ -73,8 +79,7 @@ constexpr int16_t       STALL_RPM10_THRESH= 50;     // Min measured speed (x10 R
 // --------- Stall detection behaviour [ADV] ----------
 constexpr bool          STALL_DISABLE_IN_CREEP = false; // Ignore stalls while in creep band if true (prevents slow false positives)
 constexpr int           STALL_MIN_PWM         = 50;     // Only treat low RPM as stall when PWM >= this (avoid stall at gentle starts)
-constexpr unsigned long RUN_STALL_GRACE_MS    = 50;     // Extra time after entering RUN before stall detection is allowed
-
+constexpr unsigned long RUN_STALL_GRACE_MS    = 250;     // Extra time after starting a run before stall detection is allowed
 
 // ---------------- PWM & ramps (open-loop) -----------
 // NOTE: PWM_FAST is mainly for MANUAL and as absolute clamp; AUTO uses RPM control.
@@ -82,13 +87,8 @@ constexpr int           PWM_FAST              = 255;    // [TUNE] Max allowed du
 constexpr int           START_KICK_PWM        = 60;     // [TUNE] Initial "kick" duty to break static friction (MANUAL + AUTO RAMP_UP)
 constexpr unsigned long START_KICK_MS         = 35;     // [TUNE] Duration of start kick; too long = harsh jolt, too short = no start
 constexpr unsigned long rampUpMs              = 500;    // [TUNE] Time for open-loop PWM ramp during AUTO/MANUAL ramp-up
-constexpr unsigned long rampDownMs            = 150;    // [TUNE] Time for open-loop PWM ramp-down (shorter = snappier stop)
+constexpr unsigned long rampDownMs            = 250;    // [TUNE] Time for open-loop PWM ramp-down (shorter = snappier stop)
 constexpr int           MIN_RAMP_PWM          = 40;     // [ADV] Stop ramp early if computed duty drops below this (avoid weak tail)
-
-// ------------- RPM setpoint slewing (AUTO) ----------
-constexpr unsigned long CREEP_TRANSITION_MS   = 250;    // [TUNE] Time to glide RPM setpoint in FAST band (smoother changes)
-constexpr unsigned long CREEP_SLEW_MS         = 250;    // [TUNE] Time to glide RPM setpoint when entering creep (gentle slowdown)
-
 
 // ---------------- UI timing [ADV] --------------------
 constexpr unsigned long UI_REFRESH_MS         = 100;    // UI update period; shorter = more responsive, more CPU
@@ -98,16 +98,24 @@ constexpr unsigned long LIFETIME_SPLASH_MS    = 3000;   // Duration of lifetime 
 // --------------- Toast defaults [ADV] ----------------
 constexpr unsigned long TOAST_DEFAULT_MS      = 1000;   // Default on-screen toast duration
 
+// ------ FAST→CREEP transition span [TUNE] -------------------------
+// Distance (in milli-turns) over which the RPM setpoint smoothly transitions
+// from FAST (RPM_FAST_10) to CREEP (RPM_CREEP_10) using smoothstep S-curve.
+//
+// Example:
+//   FAST2CREEP_SPAN_T1000 = 1250 → blend over 1.25 turns
+//   APPROACH_COUNTS = 775        → enter creep at 0.25 turns before target
+//   Blend starts at: 775 + 1250 = 2025 counts (2.0 turns) before target
+constexpr int16_t       FAST2CREEP_SPAN_T1000 = 1250;  // [TUNE] S-curve transition distance
 
 // ------ Approach / adaptive stop (lead) [ADV] -------
 // These control how far before the target we start braking and how that adapts.
-constexpr long          APPROACH_COUNTS       = 3875;   // Distance (counts) before target where we enter creep band (~1.25 turns)
+constexpr long          APPROACH_COUNTS       = 775;   // Distance (counts) before target where we enter creep band 
 constexpr long          STOP_LEAD_COUNTS_BASE = 310;    // Initial decel lead: counts before target where ramp-down is planned
 constexpr long          STOPLEAD_MIN          = 30;     // Minimum allowed lead; prevents braking too late
 constexpr long          STOPLEAD_MAX          = APPROACH_COUNTS - 1; // Maximum allowed lead; prevents braking too early
 constexpr uint8_t       STOPLEAD_ADAPT_K_NUM  = 2;      // Adaptation strength: numerator (~0.2 * error)
 constexpr uint8_t       STOPLEAD_ADAPT_K_DEN  = 5;      // Adaptation strength: denominator
-
 
 // ---------- Lead persist policy [ADV] ---------------
 constexpr long          LEAD_PERSIST_EPS_COUNTS = 30;   // Required change in lead before we bother saving to EEPROM
@@ -152,7 +160,7 @@ constexpr unsigned long PERSIST_MIN_INTERVAL_MS = 15000UL;    // Minimum time be
 // --- Targets in ×10 RPM [TUNE] ----------------------
 // Pick speeds that your motor can reach at ~200–230 PWM in FAST, and
 // that still have comfortable torque and smoothness in CREEP.
-constexpr int16_t       RPM_FAST_10           = 1610;   // Auto RUN speed outside approach band (x10 RPM ⇒ 165.0 RPM)
+constexpr int16_t       RPM_FAST_10           = 1650;   // Auto RUN speed outside approach band (x10 RPM ⇒ 165.0 RPM)
 constexpr int16_t       RPM_CREEP_10          = 400;    // Auto RUN speed in approach band (x10 RPM ⇒ 40.0 RPM)
 constexpr int16_t       RPM_FILTER_DIV = 3; // Low-pass filter on RPM measurement: lpf += (input - lpf) / 3 - Time constant ≈ 3 samples = 180ms at 60ms sample rate
 
@@ -160,20 +168,18 @@ constexpr int16_t       RPM_FILTER_DIV = 3; // Low-pass filter on RPM measuremen
 // --- PI gains (FAST band) [ADV] ---------------------
 // Discrete-time PI loop for speed, sampled every RPM_WINDOW_MS (60 ms).
 // PI gains in Q15 fixed-point format (divide by 32768 for real value)
-// FAST band: Kp = 3932/32768 ≈ 0.12, Ki = 655/32768 ≈ 0.02
 // CREEP band: Kp = 1638/32768 ≈ 0.05, Ki = 164/32768 ≈ 0.005
-// Tuned for: 160 RPM target, 60ms sample time, 3100 counts/rev motor
 // Higher Kp = tighter tracking, more risk of oscillation.
 // Higher Ki = better steady-state accuracy, more risk of hunting.
-
-constexpr int16_t       Kp_Q15                = 3932;   // Proportional gain (Q15) for FAST band
-constexpr int16_t       Ki_Q15                = 655;    // Integral gain (Q15) for FAST band
 
 
 // --- PI gains (CREEP band) [ADV] --------------------
 // Lower gains in creep to keep low-speed control smooth and non-jerky.
 constexpr int16_t       Kp_CREEP_Q15          = 1638;   // Proportional gain (Q15) for creep band
 constexpr int16_t       Ki_CREEP_Q15          = 164;    // Integral gain (Q15) for creep band
+
+constexpr int16_t       Kp_Q15 = Kp_CREEP_Q15;
+constexpr int16_t       Ki_Q15 = Ki_CREEP_Q15;
 
 
 // --- Feedforward model [ADV] ------------------------
@@ -235,7 +241,6 @@ void     drawUI_Debug       (int16_t rpm10, long pulses, long turns10, int pwm, 
 
 inline   void motorAnalogWrite(int duty);                   // Low-level PWM write with clamping, keeps g_pwmNow
 inline   void motorStopHard();                              // Immediate PWM=0 (hard stop)
-inline   void updateRpmSlew(unsigned long nowMs);           // Smoothly move RPM setpoint towards desired band
 void     speedControllerOnRpmSample(int16_t rpm10);         // PI speed control step on each new RPM sample
 void     resetSpeedControllerState();                       // Reset all speed-controller internal state
 
@@ -246,6 +251,7 @@ inline   long turns10_to_counts(long t10);                  // Convert ×10 turn
 inline   long counts_to_turns10(long counts);               // Convert encoder counts to ×10 turns
 inline   long counts_to_turns1000(long counts);             // Convert encoder counts to ×1000 turns (mturns)
 inline   long turns1000_to_counts(long t1000);              // Convert ×1000 turns (mturns) to counts
+int16_t smoothstepQ15(int16_t tQ);                          // t in Q15 (0..32768) → smoothstep(t) in Q15
 static   void pciSetup(uint8_t pin);                        // Configure PCINT for a given pin
 static   inline uint16_t phaseFromAbsCountsT1000(long absCounts);   // Phase (0..999) from absolute counts
 static   inline int16_t  phaseErrorT1000(uint16_t phase, uint16_t anchor); // Signed phase error vs anchor
@@ -289,11 +295,6 @@ bool              g_stallLatched       = false;      // Latched stall flag to av
 // These track the current and desired RPM setpoints and how we slew between them.
 int16_t           g_rpmSetpoint10      = 0;           // Current RPM setpoint (×10) used by PI controller
 int16_t           g_rpmDesiredSetpoint10 = 0;         // Target RPM setpoint (×10) based on band (FAST/CREEP)
-int16_t           g_rpmSlewFrom10      = 0;           // Starting setpoint for current slew
-unsigned long     g_rpmSlewStartMs     = 0;           // When the current setpoint slew started
-unsigned long     g_rpmSlewDurationMs  = CREEP_TRANSITION_MS; // Slew duration for setpoint changes
-int16_t           g_rpmPrevDesired10   = INT16_MIN;   // Last desired setpoint, to detect changes
-
 
 // ----- PI controller state -----------------------------
 // Internal state of the discrete-time PI speed controller.
@@ -530,56 +531,6 @@ inline void motorStopHard() {
   motorAnalogWrite(0);
 }
 
-
-// ----------------------------------------------------------------
-// RPM setpoint slewing (AUTO mode)
-// ----------------------------------------------------------------
-// Smoothly slews the RPM setpoint g_rpmSetpoint10 towards g_rpmDesiredSetpoint10
-// over g_rpmSlewDurationMs, using a smoothstep-like cubic profile.
-// This prevents abrupt changes in requested speed when changing bands (FAST/CREEP).
-inline void updateRpmSlew(unsigned long nowMs) {
-  // Detect change in desired setpoint and (re)start slew
-  if (g_rpmDesiredSetpoint10 != g_rpmPrevDesired10) {
-    g_rpmSlewFrom10    = g_rpmSetpoint10;
-    g_rpmSlewStartMs   = nowMs;
-    g_rpmPrevDesired10 = g_rpmDesiredSetpoint10;
-  }
-
-  // Nothing to do if we are already at the desired setpoint
-  if (g_rpmSetpoint10 == g_rpmDesiredSetpoint10) return;
-
-  unsigned long dur = g_rpmSlewDurationMs;
-  if (dur == 0UL) {
-    // No slew requested: jump directly to desired setpoint
-    g_rpmSetpoint10 = g_rpmDesiredSetpoint10;
-    return;
-  }
-
-  unsigned long elapsed = nowMs - g_rpmSlewStartMs;
-  if (elapsed >= dur) {
-    // Slew finished, snap exactly to desired setpoint
-    g_rpmSetpoint10 = g_rpmDesiredSetpoint10;
-    return;
-  }
-
-  // Smoothstep cubic: u = 3 t^2 - 2 t^3 in Q15 (t in [0,1])
-  const long ONE_Q15 = 1L << 15;
-  long tQ = (long)((elapsed << 15) / (long)dur);
-  if (tQ < 0)        tQ = 0;
-  if (tQ > ONE_Q15)  tQ = ONE_Q15;
-
-  long t2Q  = (tQ * tQ) >> 15;
-  long term = (3L << 15) - (2L * tQ);
-  long uQ   = (t2Q * term) >> 15;   // smoothstep(t) in Q15
-
-  int  span = (int)g_rpmDesiredSetpoint10 - (int)g_rpmSlewFrom10;
-  long inc  = ((long)span * uQ + (1L << 14)) >> 15;
-  int  out  = (int)g_rpmSlewFrom10 + (int)inc;
-
-  g_rpmSetpoint10 = (int16_t)out;
-}
-
-
 // ----------------------------------------------------------------
 // Atomic encoder access helpers
 // ----------------------------------------------------------------
@@ -638,6 +589,29 @@ inline long turns1000_to_counts(long t1000) {
   return num / 1000L;
 }
 
+// ----------------------------------------------------------------
+// Smoothstep helper in Q15
+// ----------------------------------------------------------------
+// Input:
+//   tQ in Q15 (0..32768) representing t ∈ [0..1]
+// Output:
+//   s(t) = 3 t^2 - 2 t^3 in Q15 (0..32768)
+// Use this to shape transitions (e.g. FAST→CREEP, duty ramps).
+int16_t smoothstepQ15(int16_t tQ) {
+  const int32_t ONE_Q15 = (1L << 15);
+
+  if (tQ <= 0)       return 0;
+  if (tQ >= ONE_Q15) return (int16_t)ONE_Q15;
+
+  int32_t t2Q = ((int32_t)tQ * (int32_t)tQ) >> 15;
+  int32_t t3Q = (t2Q * tQ) >> 15;
+  int32_t sQ  = 3L * t2Q - 2L * t3Q; // still Q15
+
+  if (sQ < 0)        sQ = 0;
+  if (sQ > ONE_Q15)  sQ = ONE_Q15;
+
+  return (int16_t)sQ;
+}
 
 // ----------------------------------------------------------------
 // QDEC (motor encoder, D2/D3 using lookup table)
@@ -1511,7 +1485,7 @@ void uiLifetimeSplashTopRightLogo() {
   display.setTextSize(1);
 
   const int16_t xLogo = SCREEN_WIDTH - LOGO_TOAST_W - 1;
-  const int16_t yLogo = 1;
+  const int16_t yLogo = 8;
   display.drawBitmap(xLogo, yLogo,
                      LOGO_SHEEP_28x24, LOGO_TOAST_W, LOGO_TOAST_H, SSD1306_WHITE);
 
@@ -1521,7 +1495,7 @@ void uiLifetimeSplashTopRightLogo() {
 
   // Compact health-focused layout
   display.setCursor(0, 0);
-  display.println(F("SkeinMachine v3.27"));
+  display.println(F("SkeinMachine v3.30"));
 
   display.setCursor(0, 12);
   display.print(F("Skeins: "));
@@ -1573,7 +1547,6 @@ void resetSpeedControllerState() {
   g_iTerm_Q15            = 0;
   g_rpmSetpoint10        = 0;
   g_rpmDesiredSetpoint10 = 0;
-  g_rpmPrevDesired10     = INT16_MIN;
 
   // Internal filters / smoothing
   g_speedRpm10Lp         = 0;
@@ -1744,7 +1717,7 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
 
       g_state               = RunState::RAMP_UP;
       g_stateStartMs        = now;
-      g_startDuty           = 0;
+      g_startDuty           = 0;  // not used in RAMP_UP, only in RAMP_DOWN
 
       digitalWrite(PIN_DIR, g_dirForward ? HIGH : LOW);
 
@@ -1763,13 +1736,13 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
       // Pedal released → ramp down to stop.
       g_state        = RunState::RAMP_DOWN;
       g_stateStartMs = now;
-      g_startDuty    = g_pwmNow;
+      g_startDuty    = g_pwmNow;   // used as starting duty for ramp-down
     }
 
     // --- MANUAL FSM ---
     switch (g_state) {
       case RunState::RAMP_UP: {
-        // Open-loop ramp to full MANUAL jog speed (PWM_FAST).
+        // Open-loop ramp to full MANUAL jog speed (PWM_FAST) with S-curve.
         g_manualDispCounts = encAtomicRead();
         digitalWrite(PIN_DIR, g_dirForward ? HIGH : LOW);
 
@@ -1779,12 +1752,28 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
           // Short kick to overcome static friction.
           motorAnalogWrite(START_KICK_PWM);
         } else {
-          if (elapsed >= rampUpMs) {
+          unsigned long rampElapsed = elapsed - START_KICK_MS;
+
+          if (rampElapsed >= rampUpMs) {
+            // Ramp finished → go to constant PWM_FAST
             motorAnalogWrite(PWM_FAST);
             g_state = RunState::RUN;
           } else {
-            int duty = (int)(((long)PWM_FAST * (long)elapsed) / (long)rampUpMs);
-            motorAnalogWrite(duty);
+            // S-curve from START_KICK_PWM → PWM_FAST over rampUpMs
+            int32_t tQ32 = ((int32_t)rampElapsed << 15) / (int32_t)rampUpMs;
+            if (tQ32 < 0)                 tQ32 = 0;
+            if (tQ32 > (1L << 15))        tQ32 = (1L << 15);
+            int16_t tQ = (int16_t)tQ32;
+
+            int16_t sQ = smoothstepQ15(tQ);  // 0..Q15
+
+            int32_t span   = (int32_t)PWM_FAST - (int32_t)START_KICK_PWM;
+            int32_t delta  = (span * (int32_t)sQ + (1L << 14)) >> 15;
+            int32_t duty32 = (int32_t)START_KICK_PWM + delta;
+            if (duty32 < 0)   duty32 = 0;
+            if (duty32 > 255) duty32 = 255;
+
+            motorAnalogWrite((int)duty32);
           }
         }
       } break;
@@ -1800,35 +1789,49 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
           g_startDuty    = g_pwmNow;
           break;
         }
+
         motorAnalogWrite(PWM_FAST);
       } break;
 
       case RunState::RAMP_DOWN: {
-        // Open-loop ramp down from last duty to zero.
+        // Open-loop ramp down from last duty to zero with S-curve in time.
         g_manualDispCounts = encAtomicRead();
         digitalWrite(PIN_DIR, g_dirForward ? HIGH : LOW);
 
         unsigned long elapsed = now - g_stateStartMs;
-        bool         finishNow = false;
-        long         duty      = g_startDuty;
+        bool          finishNow = false;
+        long          duty      = g_startDuty;
 
         if (elapsed >= rampDownMs) {
           finishNow = true;
         } else {
-          duty = g_startDuty
-               - ((long)g_startDuty * (long)elapsed) / (long)rampDownMs;
-          if (duty < MIN_RAMP_PWM) finishNow = true;
+          // S-curve from g_startDuty → 0 over rampDownMs
+          int32_t tQ32 = ((int32_t)elapsed << 15) / (int32_t)rampDownMs;
+          if (tQ32 < 0)                 tQ32 = 0;
+          if (tQ32 > (1L << 15))        tQ32 = (1L << 15);
+          int16_t tQ = (int16_t)tQ32;
+
+          int16_t sQ = smoothstepQ15(tQ);    // 0..Q15
+          int32_t fQ = (1L << 15) - (int32_t)sQ; // 1→0
+
+          int32_t duty32 = ((int32_t)g_startDuty * fQ + (1L << 14)) >> 15;
+          if (duty32 < 0) duty32 = 0;
+          duty = duty32;
+
+          if (duty < MIN_RAMP_PWM) {
+            finishNow = true;
+          }
         }
 
         if (finishNow) {
           motorStopHard();
 
           // After stop, update jog reference and allow fine positioning again.
-          long encNow2        = encAtomicRead();
-          g_manualRefEnc      = encNow2;
-          g_jogTargetRel      = 0;
-          g_manualSettleUntilMs = now + 120;
-          g_state             = RunState::IDLE;
+          long encNow2           = encAtomicRead();
+          g_manualRefEnc         = encNow2;
+          g_jogTargetRel         = 0;
+          g_manualSettleUntilMs  = now + 120;
+          g_state                = RunState::IDLE;
         } else {
           if (g_startDuty < MIN_RAMP_PWM) g_startDuty = MIN_RAMP_PWM;
           motorAnalogWrite((int)duty);
@@ -1859,7 +1862,8 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
         }
       } break;
     }
-    return;  // MANUAL handled completely
+
+    return;  // MANUAL handled completely; do NOT fall through into AUTO
   }
 
   // ----------------------------------------------------------------
@@ -1916,10 +1920,7 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
           //  - others start in fast band.
           g_inCreepBand          = smallTarget;
           g_rpmDesiredSetpoint10 = g_inCreepBand ? RPM_CREEP_10 : RPM_FAST_10;
-          g_rpmSlewDurationMs    = g_inCreepBand ? CREEP_SLEW_MS
-                                                 : CREEP_TRANSITION_MS;
           g_rpmSetpoint10        = g_rpmDesiredSetpoint10;  // start at target
-          g_rpmPrevDesired10     = g_rpmDesiredSetpoint10;
           g_iTerm_Q15            = 0;                       // reset integrator
 
           // PWM side: start at zero, PI will ramp it.
@@ -1969,12 +1970,9 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
 
         // End of RAMP_UP → transition to RUN with preloaded PI state.
         if (rampElapsed >= rampUpMs) {
-          // Slew parameters for RPM setpoint (fast/creep band).
-          g_rpmSlewDurationMs    = g_inCreepBand ? CREEP_SLEW_MS
-                                                 : CREEP_TRANSITION_MS;
+          // Initial RPM band after RAMP_UP, for debug / setpoint RPM
           g_rpmDesiredSetpoint10 = g_inCreepBand ? RPM_CREEP_10 : RPM_FAST_10;
           g_rpmSetpoint10        = g_rpmDesiredSetpoint10;
-          g_rpmPrevDesired10     = g_rpmDesiredSetpoint10;
 
           // Set controller's output and requested duty to the ramp target.
           g_desiredPwmTarget     = (int)targetDuty;
@@ -2017,34 +2015,49 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
 
       long encNow   = encAtomicRead();
       long progress = labs(encNow);
-      long error    = g_goalCounts - progress;
+      long error    = g_goalCounts - progress;   // remaining counts to target
       long stopLeadNow = g_dirForward ? g_stopLeadFwd : g_stopLeadRev;
       (void)stopLeadNow;
 
-      // --- Position-based band switching and RPM setpoint selection ---
-      long approachEnter = APPROACH_COUNTS;
+      // --- Position-based FAST→CREEP RPM setpoint (S-curve over distance) ---
+      const long approachEnter = APPROACH_COUNTS;
 
-      if (!g_inCreepBand) {
-        // Still in FAST band: when we enter the approach zone we switch to creep.
-        if (error <= approachEnter) {
-          g_inCreepBand          = true;
-          g_rpmDesiredSetpoint10 = RPM_CREEP_10;
-          g_rpmSlewDurationMs    = CREEP_SLEW_MS;
-          // Reduce integrator magnitude when entering creep for smoother behaviour.
-          g_iTerm_Q15            = g_iTerm_Q15 / 3;
-        } else {
-          // Stay in FAST band.
-          g_rpmDesiredSetpoint10 = RPM_FAST_10;
-          g_rpmSlewDurationMs    = CREEP_TRANSITION_MS;
-        }
-      } else {
-        // Once in creep band, we stay in creep until the run completes.
-        g_rpmDesiredSetpoint10 = RPM_CREEP_10;
-        g_rpmSlewDurationMs    = CREEP_SLEW_MS;
+      // Distance (in counts) over which we blend FAST→CREEP
+      long spanCounts = turns1000_to_counts(FAST2CREEP_SPAN_T1000);
+      if (spanCounts < 1) spanCounts = 1;
+
+      // Distance *before* approach zone:
+      //  error == approachEnter      → distBeforeApproach = 0   (at approach)
+      //  error == approachEnter+span → distBeforeApproach = span (far from approach)
+      long distBeforeApproach = error - approachEnter;
+
+      int16_t desiredSp10;
+
+      if (distBeforeApproach >= spanCounts) {
+        // Far before approach zone → 100% FAST
+        desiredSp10 = RPM_FAST_10;
       }
+      else if (distBeforeApproach <= 0) {
+        // At or inside approach zone → 100% CREEP
+        desiredSp10 = RPM_CREEP_10;
+      }
+      else {
+        int32_t tQ32 = ((int32_t)distBeforeApproach << 15) / (int32_t)spanCounts;
+        if (tQ32 < 0)                  tQ32 = 0;
+        if (tQ32 > (1L << 15))         tQ32 = (1L << 15);
+        int16_t tQ = (int16_t)tQ32;
 
-      // Slew only the RPM setpoint (not PWM).
-      updateRpmSlew(now);
+        int16_t sQ = smoothstepQ15(tQ);  // jouw nieuwe helper
+
+        int32_t diff10  = (int32_t)RPM_FAST_10 - (int32_t)RPM_CREEP_10;
+        int32_t blend10 = (diff10 * (int32_t)sQ + (1L << 14)) >> 15;
+        desiredSp10 = (int16_t)((int32_t)RPM_CREEP_10 + blend10);
+      }
+      g_rpmDesiredSetpoint10 = desiredSp10;
+
+      g_inCreepBand   = (error <= approachEnter);
+
+      g_rpmSetpoint10 = g_rpmDesiredSetpoint10;
 
       // --- Stop condition & adaptive stop lead ---
       if (error <= stopLeadNow && error > 0) {
@@ -2092,8 +2105,13 @@ void updateFSM(const PedalEdges& ped, unsigned long now) {
       if (elapsed >= rampDownMs) {
         finishNow = true;
       } else {
-        duty = g_startDuty
-             - ((long)g_startDuty * (long)elapsed) / (long)rampDownMs;
+        int32_t tQ32 = ((int32_t)elapsed << 15) / (int32_t)rampDownMs;
+        if (tQ32 < 0) tQ32 = 0;
+        if (tQ32 > (1L << 15)) tQ32 = (1L << 15);
+        int16_t sQ = smoothstepQ15((int16_t)tQ32);
+        int32_t fQ = (1L << 15) - (int32_t)sQ;
+        int32_t duty32 = ((int32_t)g_startDuty * fQ + (1L << 14)) >> 15;
+        duty = (duty32 < 0) ? 0 : duty32;
         if (duty < MIN_RAMP_PWM) finishNow = true;
       }
 
