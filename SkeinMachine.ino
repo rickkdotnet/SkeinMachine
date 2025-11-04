@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------
-// SkeinMachine v3.27
+// SkeinMachine v3.28
 // Smart yarn-twister controller with phase-anchored AUTO stops
 // NOW WITH CLOSED-LOOP RPM CONTROL (FAST & CREEP BANDS)
 // ----------------------------------------------------------------
@@ -7,7 +7,7 @@
 // Uses encoder feedback and adaptive braking.
 //
 // NEW IN v3.27
-// - Small cleanups, add comments etc. 
+// - Remove some magic numbers, other small fixes
 //
 // RATIONALE
 //  Heavy skeins caused RPM sag in the former PWM_CREEP band. With a PI speed
@@ -66,7 +66,7 @@ constexpr uint8_t  ROT_SW                 = 4;      // Rotary pushbutton (active
 constexpr uint16_t      COUNTS_PER_REV = 3100;      // Effective encoder counts per mechanical revolution of the hook. 
 
 // ---------------- RPM estimation [ADV] ---------------
-constexpr unsigned long RPM_WINDOW_MS     = 60;     // Time window per RPM sample; shorter = faster response, noisier
+constexpr unsigned long RPM_WINDOW_MS     = 64;     // Time window per RPM sample; shorter = faster response, noisier
 constexpr int16_t       STALL_RPM10_THRESH= 50;     // Min measured speed (x10 RPM) before we call it a stall (5.0 RPM)
 
 
@@ -87,7 +87,7 @@ constexpr int           MIN_RAMP_PWM          = 40;     // [ADV] Stop ramp early
 
 // ------------- RPM setpoint slewing (AUTO) ----------
 constexpr unsigned long CREEP_TRANSITION_MS   = 250;    // [TUNE] Time to glide RPM setpoint in FAST band (smoother changes)
-constexpr unsigned long CREEP_SLEW_MS         = 220;    // [TUNE] Time to glide RPM setpoint when entering creep (gentle slowdown)
+constexpr unsigned long CREEP_SLEW_MS         = 250;    // [TUNE] Time to glide RPM setpoint when entering creep (gentle slowdown)
 
 
 // ---------------- UI timing [ADV] --------------------
@@ -152,14 +152,20 @@ constexpr unsigned long PERSIST_MIN_INTERVAL_MS = 15000UL;    // Minimum time be
 // --- Targets in ×10 RPM [TUNE] ----------------------
 // Pick speeds that your motor can reach at ~200–230 PWM in FAST, and
 // that still have comfortable torque and smoothness in CREEP.
-constexpr int16_t       RPM_FAST_10           = 1650;   // Auto RUN speed outside approach band (x10 RPM ⇒ 165.0 RPM)
+constexpr int16_t       RPM_FAST_10           = 1610;   // Auto RUN speed outside approach band (x10 RPM ⇒ 165.0 RPM)
 constexpr int16_t       RPM_CREEP_10          = 400;    // Auto RUN speed in approach band (x10 RPM ⇒ 40.0 RPM)
+constexpr int16_t       RPM_FILTER_DIV = 3; // Low-pass filter on RPM measurement: lpf += (input - lpf) / 3 - Time constant ≈ 3 samples = 180ms at 60ms sample rate
 
 
 // --- PI gains (FAST band) [ADV] ---------------------
 // Discrete-time PI loop for speed, sampled every RPM_WINDOW_MS (60 ms).
+// PI gains in Q15 fixed-point format (divide by 32768 for real value)
+// FAST band: Kp = 3932/32768 ≈ 0.12, Ki = 655/32768 ≈ 0.02
+// CREEP band: Kp = 1638/32768 ≈ 0.05, Ki = 164/32768 ≈ 0.005
+// Tuned for: 160 RPM target, 60ms sample time, 3100 counts/rev motor
 // Higher Kp = tighter tracking, more risk of oscillation.
 // Higher Ki = better steady-state accuracy, more risk of hunting.
+
 constexpr int16_t       Kp_Q15                = 3932;   // Proportional gain (Q15) for FAST band
 constexpr int16_t       Ki_Q15                = 655;    // Integral gain (Q15) for FAST band
 
@@ -171,24 +177,30 @@ constexpr int16_t       Ki_CREEP_Q15          = 164;    // Integral gain (Q15) f
 
 
 // --- Feedforward model [ADV] ------------------------
-// Duty ≈ a * RPM + b, derived from two measured points (e.g., 40 RPM → ~70, 160 RPM → ~255).
+// Duty ≈ a * RPM + b, derived from two measured points (e.g., 40 RPM → ~75, 160 RPM → ~255).
+// Slope: a = 1.5 exactly (192/128)
+// Intercept: b = 15
 // This gives the PI loop a good starting point so it only has to trim.
-constexpr int16_t       FF_A_NUM              = 185;    // FF slope numerator (≈ 1.445)
+constexpr int16_t       FF_A_NUM              = 192;    // FF slope numerator (≈ 1.445)
 constexpr int16_t       FF_A_DEN              = 128;    // FF slope denominator
-constexpr int8_t        FF_B_DUTY             = 12;     // FF intercept duty (baseline offset)
-
+constexpr int8_t        FF_B_DUTY             = 15;     // FF intercept duty (baseline offset)
 
 // --- Deadband / smoothing [ADV] ---------------------
 // Deadband freezes the integrator near setpoint to avoid "chattering".
 // Smoothing shapes how aggressively PWM steps move towards the new value.
 constexpr int8_t        RPM_DBAND_RPM         = 2;      // Error deadband in FAST band; larger = more stable, less precise
+// IIR smoothing for PWM command: new_pwm = old_pwm + (target - old_pwm) * ALPHA
+// ALPHA = 1/4 means PWM changes by 25% of error each sample (60ms)
 constexpr uint8_t       ALPHA_NUM             = 1;      // FAST band IIR smoothing numerator (e.g., 1/4 step per sample)
 constexpr uint8_t       ALPHA_DEN             = 4;      // FAST band IIR smoothing denominator
-
 
 // --- Controller limits & anti-windup [ADV] ----------
 constexpr int           CTRL_PWM_MIN          = 40;     // Min PWM the controller will command (below this we assume no useful torque)
 constexpr int           CTRL_PWM_MAX          = 255;    // Max PWM the controller will command (absolute safety clamp)
+
+// Anti-windup limits in Q15 domain
+// ±(1<<18) in Q15 = ±(1<<18)/32768 = ±8 in PWM units
+// This allows integrator to accumulate ±8 PWM worth of error correction
 constexpr int32_t       ITERM_MIN             = -(1L<<18); // Lower bound for integral term (prevents extreme windup)
 constexpr int32_t       ITERM_MAX             =  (1L<<18); // Upper bound for integral term
 
@@ -330,8 +342,7 @@ long              g_manualRefEnc       = 0;    // Encoder reference position at 
 long              g_jogTargetRel       = 0;    // Relative jog target (counts offset from g_manualRefEnc)
 const long JOG_COUNTS_PER_DETENT =
   (long)((COUNTS_PER_REV + (ROT_DETENTS_PER_REV / 2)) / ROT_DETENTS_PER_REV); // Counts per rotary detent
-const long        JOG_TOL              =
-  (long)((JOG_COUNTS_PER_DETENT / 2) > 1 ? (JOG_COUNTS_PER_DETENT / 2) : 1); // Error tolerance to stop jog motor
+const long JOG_TOL = max(1L, JOG_COUNTS_PER_DETENT / 2);   // Jog tolerance: half a detent step, minimum 1 count
 unsigned long     g_manualSettleUntilMs = 0;   // Delay after stopping before jog corrections are allowed
 
 
@@ -676,17 +687,18 @@ static void pciSetup(uint8_t pin) {
 // Compute current phase (0..999) from absolute encoder counts.
 static inline uint16_t phaseFromAbsCountsT1000(long absCounts) {
   long t1000 = counts_to_turns1000(absCounts);   // total milliturns
-  long r     = t1000 % 1000L;                   // wrap to 0..999
-  if (r < 0) r += 1000L;
-  return (uint16_t)r;
+  long phase = t1000 % 1000L;                   // wrap to 0..999
+  return (phase < 0) ? phase + 1000 : phase;
 }
 
 // Compute signed phase error between current phase and anchor.
 // Result is in range [-500..+500] milliturns (shortest direction).
 static inline int16_t phaseErrorT1000(uint16_t phase, uint16_t anchor) {
+  // Compute shortest signed distance between two phases (0-999)
+  // If error > 500 mturns, it's shorter to go the other direction
   int16_t e = (int16_t)phase - (int16_t)anchor;
-  if (e >  500) e -= 1000;
-  if (e < -500) e += 1000;
+  if (e >  500) e -= 1000; // Wrap: e.g., 600 → -400 (shorter)
+  if (e < -500) e += 1000; // Wrap: e.g., -600 → 400
   return e;
 }
 
@@ -701,28 +713,25 @@ static inline int16_t phaseErrorT1000(uint16_t phase, uint16_t anchor) {
 // Estimate motor speed in ×10 RPM using encoder counts over a fixed time window.
 // Returns INT16_MIN when not enough time has passed since the last sample.
 int16_t rpm10SinceWindow() {
-  unsigned long now = millis();
-  unsigned long dt  = now - g_rpm_lastMs;
-  if (dt < RPM_WINDOW_MS) return INT16_MIN;
-
-  long cNow  = encAtomicRead();
-  long delta = cNow - g_rpm_lastCounts;
-  g_rpm_lastCounts = cNow;
-  g_rpm_lastMs     = now;
-  if (dt == 0) return INT16_MIN;
-
-  // Conversion factor is derived from counts → turns → RPM, with ×10 scaling.
-  long num = delta * 5625L;
-  long den = (long)dt * 29L;
-  long v;
-
-  if (num >= 0) v = (num + den / 2) / den;   // rounded division
-  else          v = (num - den / 2) / den;
-
-  if (v >  32767) v =  32767;
-  if (v < -32768) v = -32768;
-
-  return (int16_t)v;
+    unsigned long now = millis();
+    unsigned long dt = now - g_rpm_lastMs;
+    if (dt < RPM_WINDOW_MS) return INT16_MIN;
+    
+    long cNow = encAtomicRead();
+    long delta = cNow - g_rpm_lastCounts;
+    g_rpm_lastCounts = cNow;
+    g_rpm_lastMs = now;
+    if (dt == 0) return INT16_MIN;
+    
+    // RPM×10 = (delta_counts / COUNTS_PER_REV) / (dt_ms / 60000_ms) × 10
+    //        = (delta × 600000) / (COUNTS_PER_REV × dt)
+    long num = delta * 600000L;  // 60000 ms/min × 10 scale factor
+    long den = (long)COUNTS_PER_REV * (long)dt;
+    long v = (num >= 0) ? ((num + den/2) / den) : ((num - den/2) / den);
+    
+    if (v >  32767) v =  32767;
+    if (v < -32768) v = -32768;
+    return (int16_t)v;
 }
 
 
@@ -1512,7 +1521,7 @@ void uiLifetimeSplashTopRightLogo() {
 
   // Compact health-focused layout
   display.setCursor(0, 0);
-  display.println(F("SkeinMachine v3.26"));
+  display.println(F("SkeinMachine v3.27"));
 
   display.setCursor(0, 12);
   display.print(F("Skeins: "));
@@ -1603,7 +1612,7 @@ void speedControllerOnRpmSample(int16_t rpm10) {
       g_speedLpInited = true;
     }
     int32_t d = (int32_t)rpm10 - (int32_t)g_speedRpm10Lp;
-    g_speedRpm10Lp += (int16_t)((d + 1) / 3);  // ~1/3 step update
+    g_speedRpm10Lp += (int16_t)((d + 1) / RPM_FILTER_DIV);  // ~1/3 step update
     rpm10_f = g_speedRpm10Lp;
   }
 
